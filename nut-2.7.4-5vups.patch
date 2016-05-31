@@ -1,0 +1,270 @@
+--- nut-2.7.4/drivers/5vups.c
++++ nut-2.7.4-5vups/drivers/5vups.c
+@@ -0,0 +1,248 @@
++/*
++	anything commented is optional
++	anything else is mandatory
++	 
++	for more information, refer to:
++	* docs/developers.txt
++	* docs/new-drivers.txt
++	* docs/new-names.txt
++	
++	and possibly also to:
++	* docs/hid-subdrivers.txt for USB/HID devices
++	* or docs/snmp-subdrivers.txt for SNMP devices
++*/
++
++#include "main.h"
++#include "serial.h"
++
++
++#define DRIVER_NAME	"Custom 5V UPS driver"
++#define DRIVER_VERSION	"0.03"
++static int instcmd(const char *cmdname, const char *extra);
++
++/* driver description structure */
++upsdrv_info_t upsdrv_info = {
++	DRIVER_NAME,
++	DRIVER_VERSION,
++	"Robert Ahlskog <robert.ahlskog@gmail.com>",
++	DRV_EXPERIMENTAL,
++	{ NULL }
++};
++
++void upsdrv_initinfo(void)
++{
++	char temp[32];
++	int ret;
++	
++	ret = ser_send(upsfd, "\r");
++	ret = ser_get_buf(upsfd, temp, sizeof(temp), 1, 0);
++	if (ret < 0)
++		fatalx(EXIT_FAILURE, "No UPS found");
++	
++	/* try to detect the UPS here - call fatal_with_errno(EXIT_FAILURE, ...)
++	 * or fatalx(EXIT_FAILURE, ...) if it fails */
++
++	dstate_setinfo("ups.mfr", "Homemade");
++	dstate_setinfo("ups.model", "5VUPS");
++	/* note: for a transition period, these data are redundant! */
++	dstate_setinfo("device.mfr", "Homemade");
++	dstate_setinfo("device.model", "5VUPS");
++
++	dstate_addcmd ("shutdown.return");
++	dstate_addcmd ("shutdown.reboot");
++	upsh.instcmd = instcmd;
++}
++
++void upsdrv_updateinfo(void)
++{
++	char command[32];
++	char reply[32];
++	char *token;
++	int ret, value;
++	
++	/* Send query to the UPS */
++	strncpy(command, "status\r", 31);
++	ret = ser_send(upsfd, "%s", command);
++
++	if (ret < 0) {
++		upsdebug_with_errno(3, "send");
++		dstate_datastale();
++		return;
++	}
++	if (ret == 0) {
++		upsdebug_with_errno(3, "send: timeout");
++		dstate_datastale();
++		return;
++	}
++	upsdebugx(3, "send: %.*s", (int)strcspn(command, "\r"), command);
++	
++	
++	/* Read back the reply */
++	ret = ser_get_buf(upsfd, reply, sizeof(reply), 1, 0);
++	upsdebugx(3, "read: %.*s", (int)strcspn(reply, "\r"), reply);
++	while (ret > 0)
++	{
++		if (strncmp(reply, "ups.status", 10) == 0)
++		{
++			status_init();
++			token = strtok(reply+11, " ");
++			while (token != NULL)
++			{
++				status_set(token);
++				token = strtok(NULL, " ");
++			}
++			status_commit();
++		}
++		else if (strncmp(reply, "input.voltage", 13) == 0)
++		{
++			value = atoi(reply+14);
++			dstate_setinfo("input.voltage", "%0.2f", value/100.0f);
++		}
++		else if (strncmp(reply, "battery.voltage", 15) == 0)
++		{
++			value = atoi(reply+16);
++			dstate_setinfo("battery.voltage", "%0.2f", value/100.0f);
++		}
++		else if (strncmp(reply, "battery.charge", 14) == 0)
++		{
++			value = atoi(reply+15);
++			dstate_setinfo("battery.charge", "%0.1f", (float)value);
++		}
++		ret = ser_get_buf(upsfd, reply, sizeof(reply), 1, 0);
++		upsdebugx(3, "read: %.*s", (int)strcspn(reply, "\r"), reply);
++	}
++	if (ret < 0) {
++		upsdebug_with_errno(3, "read");
++		dstate_datastale();
++		return;
++	}
++	
++	dstate_dataok();
++}
++
++void upsdrv_shutdown(void)
++{
++	char command[32];
++	char reply[32];
++	int ret;
++	const char *status;
++	
++	/* you may have to check the line status since the commands
++	   for toggling power are frequently different for OL vs. OB */
++	status = dstate_getinfo("ups.status");
++	if (strstr(status, "OL") != NULL)
++	{
++	/* OL: this must power cycle the load if possible */
++		strncpy(command, "reboot 10 10\r", 31);
++	}
++	else
++	{
++	/* OB: the load must remain off until the power returns */
++		strncpy(command, "shutdown 30\r", 31);
++	}
++	
++	/* Send query to the UPS */
++	ret = ser_send(upsfd, "%s", command);
++	if (ret < 0) {
++		upsdebug_with_errno(3, "send");
++		return;
++	}
++	if (ret == 0) {
++		upsdebug_with_errno(3, "send: timeout");
++		return;
++	}
++	upsdebugx(3, "send: %.*s", (int)strcspn(command, "\r"), command);
++	ret = ser_get_buf(upsfd, reply, sizeof(reply), 1, 0);
++	
++}
++
++
++static int instcmd(const char *cmdname, const char *extra)
++{
++	char reply[32];
++	int ret;
++	
++	if (!strcasecmp(cmdname, "shutdown.return")) {
++		ser_send(upsfd, "shutdown %d", 30);
++		ret = ser_get_buf(upsfd, reply, sizeof(reply), 1, 0);
++		if (ret > 0)
++		{
++			
++		}
++		return STAT_INSTCMD_HANDLED;
++	}
++	if (!strcasecmp(cmdname, "shutdown.reboot")) {
++		ser_send(upsfd, "reboot %d %d", 5, 10);
++		ret = ser_get_buf(upsfd, reply, sizeof(reply), 1, 0);
++		if (ret > 0)
++		{
++			
++		}
++		return STAT_INSTCMD_HANDLED;
++	}
++
++	upslogx(LOG_NOTICE, "instcmd: unknown command [%s]", cmdname);
++	return STAT_INSTCMD_UNKNOWN;
++}
++
++/*
++static int setvar(const char *varname, const char *val)
++{
++	if (!strcasecmp(varname, "ups.test.interval")) {
++		ser_send_buf(upsfd, ...);
++		return STAT_SET_HANDLED;
++	}
++
++	upslogx(LOG_NOTICE, "setvar: unknown variable [%s]", varname);
++	return STAT_SET_UNKNOWN;
++}
++*/
++
++void upsdrv_help(void)
++{
++}
++
++/* list flags and values that you want to receive via -x */
++void upsdrv_makevartable(void)
++{
++	/* allow '-x xyzzy' */
++	/* addvar(VAR_FLAG, "xyzzy", "Enable xyzzy mode"); */
++
++	/* allow '-x foo=<some value>' */
++	/* addvar(VAR_VALUE, "foo", "Override foo setting"); */
++}
++
++void upsdrv_initups(void)
++{
++	struct termios	tio;
++	
++	upsfd = ser_open(device_path);
++	ser_set_speed(upsfd, device_path, B9600);
++	
++	if (tcgetattr(upsfd, &tio)) {
++		fatal_with_errno(EXIT_FAILURE, "tcgetattr");
++	}
++	/*
++	 * Use canonical mode input processing (to read reply line)
++	 */
++	tio.c_lflag |= ICANON;	/* Canonical input (erase and kill processing) */
++	
++	tio.c_cc[VEOF] = _POSIX_VDISABLE;
++	tio.c_cc[VEOL] = '\r';
++	tio.c_cc[VERASE] = _POSIX_VDISABLE;
++	tio.c_cc[VINTR]  = _POSIX_VDISABLE;
++	tio.c_cc[VKILL]  = _POSIX_VDISABLE;
++	tio.c_cc[VQUIT]  = _POSIX_VDISABLE;
++	tio.c_cc[VSUSP]  = _POSIX_VDISABLE;
++	tio.c_cc[VSTART] = _POSIX_VDISABLE;
++	tio.c_cc[VSTOP]  = _POSIX_VDISABLE;
++	
++	if (tcsetattr(upsfd, TCSANOW, &tio)) {
++		fatal_with_errno(EXIT_FAILURE, "tcsetattr");
++	}
++}
++
++void upsdrv_cleanup(void)
++{
++	ser_close(upsfd, device_path);
++}
+--- nut-2.7.4/drivers/Makefile.am
++++ nut-2.7.4-5vups/drivers/Makefile.am
+@@ -29,7 +29,7 @@
+   AM_CFLAGS += $(LIBIPMI_CFLAGS)
+ endif
+ 
+-SERIAL_DRIVERLIST = al175 bcmxcp belkin belkinunv bestfcom	\
++SERIAL_DRIVERLIST = 5vups al175 bcmxcp belkin belkinunv bestfcom	\
+  bestfortress bestuferrups bestups dummy-ups etapro everups 	\
+  gamatronic genericups isbmex liebert liebert-esp2 masterguard metasys	\
+  oldmge-shut mge-utalk microdowell mge-shut oneac optiups powercom rhino 	\
+@@ -93,6 +93,7 @@
+ upsdrvctl_LDADD = $(LDADD_COMMON)
+ 
+ # serial drivers: all of them use standard LDADD and CFLAGS
++5vups_SOURCES = 5vups.c
+ al175_SOURCES = al175.c
+ apcsmart_SOURCES = apcsmart.c apcsmart_tabs.c
+ apcsmart_old_SOURCES = apcsmart-old.c
